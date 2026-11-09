@@ -42,7 +42,6 @@ from .const import (
     SAMPLES_PER_CHUNK,
 )
 from .error import (
-    DuplicateWakeUpDetectedError,
     IntentRecognitionError,
     PipelineRunValidationError,
     SpeechToTextError,
@@ -221,7 +220,7 @@ class _DefaultPipelineProcessor:
 
     @callback
     def cleanup(self) -> None:
-        """Clean up resources after a pipeline error."""
+        """Clean up resources when a run stops early."""
         if self.tts_stream is not None:
             self.tts_stream.delete()
             self.tts_stream = None
@@ -641,30 +640,21 @@ class _DefaultPipelineProcessor:
         wake_word_audio_ms: int,
         verdict: voice_support.WakeWordAccepted | voice_support.WakeWordRejected | None,
     ) -> bool:
-        """Accept the wake word at the start of the stream, unless refused.
+        """Accept the wake word whose audio starts the stream, unless refused.
 
         Accepting starts the duplicate cooldown, which a refused detection
         must not do, so the run's verdict comes first.
         """
-        reason: str | None = None
-        if isinstance(verdict, voice_support.WakeWordRejected):
-            accepted = False
-            reason = verdict.reason or "unverified"
-        else:
-            try:
-                self.host.accept_wake_word(wake_word_phrase)
-            except DuplicateWakeUpDetectedError:
-                accepted = False
-                reason = "duplicate"
-            else:
-                accepted = True
-
         wake_word_output: dict[str, Any] = {
             "wake_word_phrase": wake_word_phrase,
             "wake_word_audio_ms": wake_word_audio_ms,
         }
-        if reason is not None:
-            wake_word_output["reason"] = reason
+        if isinstance(verdict, voice_support.WakeWordRejected):
+            accepted = False
+            wake_word_output["reason"] = verdict.reason or "unverified"
+        else:
+            self.host.accept_wake_word(wake_word_phrase)
+            accepted = True
 
         self.host.process_event(
             PipelineEvent(
@@ -1273,12 +1263,12 @@ class _DefaultPipelineProcessor:
         stt_audio_buffer: list[EnhancedAudioChunk] = []
         stt_processed_stream: AsyncIterable[EnhancedAudioChunk] | None = None
         stt_stream = request.stt_stream
+        skipped_ms = 0
 
         wake_word_verdict: (
             voice_support.WakeWordAccepted | voice_support.WakeWordRejected | None
         ) = None
         wake_word_audio_ms = request.wake_word_audio_ms
-        stt_start_ms = 0
 
         if (stt_stream is not None) and (current_stage == PipelineStage.STT):
             self._audio_run = await self._async_start_audio_run(request, stt_stream)
@@ -1292,25 +1282,23 @@ class _DefaultPipelineProcessor:
                     wake_word_audio_ms = wake_word_verdict.wake_word_audio_ms
 
             if wake_word_audio_ms is not None:
-                # Whole chunks only, since the partial chunk at the end is
-                # dropped. Timestamps count from here on as from the start
-                # of the run, as they do when the pipeline finds the wake word.
-                stt_start_ms = (wake_word_audio_ms // MS_PER_CHUNK) * MS_PER_CHUNK
+                # Whole chunks only, since the partial chunk at the end is dropped
+                skipped_ms = (wake_word_audio_ms // MS_PER_CHUNK) * MS_PER_CHUNK
                 stt_stream = _skip_audio(
-                    stt_stream, (stt_start_ms // MS_PER_CHUNK) * BYTES_PER_CHUNK
+                    stt_stream, skipped_ms * BYTES_PER_CHUNK // MS_PER_CHUNK
                 )
 
         if stt_stream is not None:
+            # Timestamps count from the start of the stream, as when the
+            # pipeline detects the wake word itself
             if self.host.audio_settings.needs_processor:
                 # VAD/noise suppression/auto gain/volume
                 stt_processed_stream = self.process_enhance_audio(
-                    stt_stream, stt_start_ms
+                    stt_stream, skipped_ms
                 )
             else:
                 # Volume multiplier only
-                stt_processed_stream = self.process_volume_only(
-                    stt_stream, stt_start_ms
-                )
+                stt_processed_stream = self.process_volume_only(stt_stream, skipped_ms)
 
         if current_stage == PipelineStage.WAKE_WORD:
             # wake-word-detection
